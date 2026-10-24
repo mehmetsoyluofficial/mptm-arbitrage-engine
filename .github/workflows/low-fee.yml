@@ -1,0 +1,29 @@
+name: Low Fee Cross Market Research
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17,47 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compare public quotes
+        run: python cross_market.py
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: low-fee-market-${{ github.run_id }}
+          path: cross_market_results.json
+          if-no-files-found: ignore
+          retention-days: 3
