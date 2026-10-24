@@ -1,0 +1,26 @@
+name: Gold Token Arbitrage Research
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '11,41 * * * *'
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Scan PAXG and XAUT order books
+        run: python gold_scanner.py
+      - name: Save research results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gold-observations-${{ github.run_id }}
+          path: gold_results.json
+          if-no-files-found: ignore
+          retention-days: 3
