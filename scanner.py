@@ -1,82 +1,134 @@
-"""Read-only Binance triangular-arbitrage research. No trades or secrets."""
+"""MPTM v0.5: read-only market research with depth and exchange filters."""
 import datetime
 import json
 import sys
 import urllib.request
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 
-BASE_URL = "https://data-api.binance.vision/api/v3/"
+API = "https://data-api.binance.vision/api/v3/"
+D = Decimal
 
-def fetch(endpoint):
-    request = urllib.request.Request(
-        BASE_URL + endpoint, headers={"User-Agent": "MPTM-research/0.4"}
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
+def fetch(path):
+    req = urllib.request.Request(API + path, headers={"User-Agent": "MPTM-research/0.5"})
+    with urllib.request.urlopen(req, timeout=20) as response:
         return json.load(response)
 
-def triangles(books, symbols, start=Decimal("10"), fee=Decimal("0.001")):
+def floor_step(value, step):
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step if step > 0 else value
+
+def build(info, books, fee):
+    symbols = {s["symbol"]: s for s in info["symbols"] if s["status"] == "TRADING" and s.get("isSpotTradingAllowed", True)}
     edges = {}
-    for item in books:
-        symbol = item["symbol"]
-        if symbol not in symbols:
+    for b in books:
+        s = symbols.get(b["symbol"])
+        if not s:
             continue
-        base, quote = symbols[symbol]
-        bid = Decimal(item["bidPrice"])
-        ask = Decimal(item["askPrice"])
+        bid, ask = D(b["bidPrice"]), D(b["askPrice"])
         if bid <= 0 or ask <= 0:
             continue
-        edges[(base, quote)] = (bid * (1 - fee), symbol)
-        edges[(quote, base)] = ((1 / ask) * (1 - fee), symbol)
-    by_source = {}
-    for (source, target), edge in edges.items():
-        by_source.setdefault(source, []).append((target, edge))
-    results = []
-    for second, (rate1, sym1) in by_source.get("USDT", []):
-        for third, (rate2, sym2) in by_source.get(second, []):
-            if third in ("USDT", second):
+        base, quote = s["baseAsset"], s["quoteAsset"]
+        edges[(base, quote)] = (bid * (1-fee), b["symbol"], "SELL")
+        edges[(quote, base)] = ((1/ask) * (1-fee), b["symbol"], "BUY")
+    return symbols, edges
+
+def candidates(edges, amount):
+    outgoing = {}
+    for (a,b), edge in edges.items():
+        outgoing.setdefault(a, []).append((b,edge))
+    found = []
+    for b, e1 in outgoing.get("USDT", []):
+        for c, e2 in outgoing.get(b, []):
+            if c in ("USDT", b):
                 continue
-            final_edge = edges.get((third, "USDT"))
-            if not final_edge:
+            e3 = edges.get((c,"USDT"))
+            if not e3:
                 continue
-            rate3, sym3 = final_edge
-            ending = start * rate1 * rate2 * rate3
-            pct = (ending / start - 1) * 100
-            results.append({
-                "path": ["USDT", second, third, "USDT"],
-                "pairs": [sym1, sym2, sym3],
-                "estimated_end_usdt": str(round(ending, 8)),
-                "estimated_pct": str(round(pct, 5)),
-            })
-    return sorted(results, key=lambda item: Decimal(item["estimated_pct"]), reverse=True)
+            end = amount * e1[0] * e2[0] * e3[0]
+            found.append({"path":["USDT",b,c,"USDT"],"legs":[e1,e2,e3],"indicative_end":end})
+    return sorted(found,key=lambda x:x["indicative_end"],reverse=True)
+
+def filter_values(symbol):
+    out = {}
+    for f in symbol["filters"]:
+        if f["filterType"] in ("LOT_SIZE","MARKET_LOT_SIZE","MIN_NOTIONAL","NOTIONAL"):
+            out[f["filterType"]] = f
+    return out
+
+def simulate(candidate, symbols, fee, amount):
+    balance = amount
+    steps = []
+    for i, (symbol, side) in enumerate((leg[1],leg[2]) for leg in candidate["legs"]):
+        spec = symbols[symbol]
+        filters = filter_values(spec)
+        lot = filters.get("LOT_SIZE",{})
+        min_qty = D(lot.get("minQty","0"))
+        max_qty = D(lot.get("maxQty","999999999"))
+        step = D(lot.get("stepSize","0"))
+        orderbook = fetch("depth?symbol=" + symbol + "&limit=100")
+        levels = orderbook["asks"] if side == "BUY" else orderbook["bids"]
+        remaining = balance
+        received = D("0")
+        spent_quote = D("0")
+        sold_base = D("0")
+        for price_text, qty_text in levels:
+            price, available = D(price_text), D(qty_text)
+            if side == "BUY":
+                qty = min(available,remaining/price)
+                received += qty
+                spent_quote += qty*price
+                remaining -= qty*price
+            else:
+                qty = min(available,remaining)
+                received += qty*price
+                sold_base += qty
+                remaining -= qty
+            if remaining <= D("0.00000000001"):
+                break
+        if remaining > D("0.00000001"):
+            return {"status":"REJECT","reason":"Insufficient depth for complete fill","leg":i+1}
+        quantity = received if side == "BUY" else sold_base
+        rounded = floor_step(quantity,step)
+        if rounded < min_qty or rounded > max_qty or rounded != quantity:
+            return {"status":"REJECT","reason":"LOT_SIZE/precision or leftover funds","leg":i+1}
+        notional = spent_quote if side == "BUY" else received
+        minimum = D(filters.get("NOTIONAL",filters.get("MIN_NOTIONAL",{})).get("minNotional","0"))
+        if notional < minimum:
+            return {"status":"REJECT","reason":"MIN_NOTIONAL","leg":i+1,"notional":str(notional),"minimum":str(minimum)}
+        balance = received*(1-fee)
+        steps.append({"symbol":symbol,"side":side,"output":str(balance)})
+    return {"status":"INDICATIVE_DEPTH_PASS","estimated_end_usdt":str(balance),"estimated_profit_usdt":str(balance-amount),"steps":steps,
+            "warning":"Sequential snapshots, not synchronized; fee assumptions, trading permissions, execution, slippage and other filters not fully validated."}
 
 def main():
-    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    amount,fee = D("10"),D("0.001")
     info = fetch("exchangeInfo")
-    symbols = {
-        item["symbol"]: (item["baseAsset"], item["quoteAsset"])
-        for item in info["symbols"]
-        if item["status"] == "TRADING" and item.get("isSpotTradingAllowed", True)
-    }
     books = fetch("ticker/bookTicker")
-    candidates = triangles(books, symbols)
-    output = {
-        "timestamp_utc": timestamp,
-        "source": "Binance public best bid/ask",
-        "assumed_fee_per_leg": "0.1%",
-        "starting_virtual_usdt": "10",
-        "limitations": "Not executable: asynchronous prices; no depth, minimums, precision, slippage or region check",
-        "pairs": len(books),
-        "triangles": len(candidates),
-        "positive_indicative": sum(Decimal(c["estimated_pct"]) > 0 for c in candidates),
-        "top_10": candidates[:10],
+    symbols,edges = build(info,books,fee)
+    ranked = candidates(edges,amount)
+    positive = [c for c in ranked if c["indicative_end"] > amount]
+    checks = []
+    for c in positive[:5]:
+        item = {"path":c["path"],"pairs":[leg[1] for leg in c["legs"]],"indicative_end_usdt":str(c["indicative_end"])}
+        try:
+            item["depth_check"] = simulate(c,symbols,fee,amount)
+        except Exception as exc:
+            item["depth_check"] = {"status":"DATA_UNAVAILABLE","reason":str(exc)}
+        checks.append(item)
+    result = {
+        "timestamp_utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "source":"Binance public spot best bid/ask and sampled depth",
+        "virtual_start_usdt":str(amount),"assumed_fee_per_leg":str(fee),
+        "pairs":len(books),"triangles":len(ranked),"positive_indicative":len(positive),
+        "depth_checked":checks,"verified_executable_profit":None,
+        "notes":"Read-only; no synchronized executable orders. Regional permissions, full exchange filters and account fees not confirmed."
     }
-    with open("results.json", "w", encoding="utf-8") as handle:
-        json.dump(output, handle, indent=2)
-    print(json.dumps(output, indent=2))
+    with open("results.json","w",encoding="utf-8") as f:
+        json.dump(result,f,indent=2)
+    print(json.dumps(result,indent=2))
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print("DATA_UNAVAILABLE:", exc, file=sys.stderr)
+        print("DATA_UNAVAILABLE:",exc,file=sys.stderr)
         sys.exit(2)
