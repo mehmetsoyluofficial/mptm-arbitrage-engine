@@ -1,4 +1,4 @@
-"""MPTM v0.5: read-only market research with depth and exchange filters."""
+"""MPTM v0.6: read-only market research with depth and exchange filters."""
 import datetime
 import json
 import sys
@@ -9,7 +9,7 @@ API = "https://data-api.binance.vision/api/v3/"
 D = Decimal
 
 def fetch(path):
-    req = urllib.request.Request(API + path, headers={"User-Agent": "MPTM-research/0.5"})
+    req = urllib.request.Request(API + path, headers={"User-Agent": "MPTM-research/0.6"})
     with urllib.request.urlopen(req, timeout=20) as response:
         return json.load(response)
 
@@ -31,20 +31,20 @@ def build(info, books, fee):
         edges[(quote, base)] = ((1/ask) * (1-fee), b["symbol"], "BUY")
     return symbols, edges
 
-def candidates(edges, amount):
+def candidates(edges, amount, start_asset="USDT"):
     outgoing = {}
     for (a,b), edge in edges.items():
         outgoing.setdefault(a, []).append((b,edge))
     found = []
-    for b, e1 in outgoing.get("USDT", []):
+    for b, e1 in outgoing.get(start_asset, []):
         for c, e2 in outgoing.get(b, []):
-            if c in ("USDT", b):
+            if c in (start_asset, b):
                 continue
-            e3 = edges.get((c,"USDT"))
+            e3 = edges.get((c,start_asset))
             if not e3:
                 continue
             end = amount * e1[0] * e2[0] * e3[0]
-            found.append({"path":["USDT",b,c,"USDT"],"legs":[e1,e2,e3],"indicative_end":end})
+            found.append({"path":[start_asset,b,c,start_asset],"legs":[e1,e2,e3],"indicative_end":end})
     return sorted(found,key=lambda x:x["indicative_end"],reverse=True)
 
 def filter_values(symbol):
@@ -104,7 +104,23 @@ def main():
     info = fetch("exchangeInfo")
     books = fetch("ticker/bookTicker")
     symbols,edges = build(info,books,fee)
-    ranked = candidates(edges,amount)
+    starts = ["USDT","USDC","BTC","ETH","BNB","SOL","EUR","TRY"]
+    scans = []
+    for asset in starts:
+        ranked = candidates(edges, D("1"), asset)
+        positive = [c for c in ranked if c["indicative_end"] > D("1")]
+        scans.append({
+            "start_asset": asset,
+            "triangles": len(ranked),
+            "positive_indicative": len(positive),
+            "best_pct": str(round((ranked[0]["indicative_end"]-D("1"))*100,5)) if ranked else None,
+            "top_3": [{"path":c["path"],"pairs":[leg[1] for leg in c["legs"]],
+                       "indicative_pct":str(round((c["indicative_end"]-D("1"))*100,5))}
+                      for c in ranked[:3]]
+        })
+    # 10-USDT depth checks remain USDT-only; other asset balances require
+    # separate size conversion, precision and funding validation.
+    ranked = candidates(edges,amount,"USDT")
     positive = [c for c in ranked if c["indicative_end"] > amount]
     checks = []
     for c in positive[:5]:
@@ -118,9 +134,9 @@ def main():
         "timestamp_utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "source":"Binance public spot best bid/ask and sampled depth",
         "virtual_start_usdt":str(amount),"assumed_fee_per_leg":str(fee),
-        "pairs":len(books),"triangles":len(ranked),"positive_indicative":len(positive),
-        "depth_checked":checks,"verified_executable_profit":None,
-        "notes":"Read-only; no synchronized executable orders. Regional permissions, full exchange filters and account fees not confirmed."
+        "pairs":len(books),"asset_scans":scans,
+        "usdt_depth_checked":checks,"verified_executable_profit":None,
+        "notes":"Other asset scans use unit-normalized percentage, not executable dollar profits. Read-only; no synchronized orders, region check or account fee validation."
     }
     with open("results.json","w",encoding="utf-8") as f:
         json.dump(result,f,indent=2)
