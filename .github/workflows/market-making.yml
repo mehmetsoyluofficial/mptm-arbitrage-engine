@@ -1,0 +1,29 @@
+name: Market Making Feasibility
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Analyze spreads without orders
+        run: python market_making_pilot.py
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-making-${{ github.run_id }}
+          path: market_making_results.json
+          if-no-files-found: ignore
+          retention-days: 3
