@@ -1,0 +1,29 @@
+name: MPTM Read-Only Scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Scan public market data
+        run: python scanner.py
+      - name: Upload observation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mptm-observation-${{ github.run_id }}
+          path: results.json
+          if-no-files-found: ignore
+          retention-days: 3
