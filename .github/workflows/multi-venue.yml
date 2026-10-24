@@ -1,0 +1,29 @@
+name: Multi Venue Market Research
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '9,39 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compare markets
+        run: python multi_venue.py
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-venue-${{ github.run_id }}
+          path: multi_venue_results.json
+          if-no-files-found: ignore
+          retention-days: 3
